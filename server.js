@@ -57,7 +57,10 @@ async function callGemini(systemPrompt, history, userMessage) {
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: systemPrompt }] },
         contents,
-        generationConfig: { maxOutputTokens: 150 }
+        generationConfig: {
+          maxOutputTokens: 200,
+          thinkingConfig: { thinkingBudget: 0 }
+        }
       })
     }
   );
@@ -83,6 +86,19 @@ app.get("/", (req, res) => {
 app.get("/health", (req, res) => {
   res.json({ status: "ok", playersOnline: Object.keys(players).length });
 });
+
+const parties = {};     // partyId -> { members: { socketId -> {name, level, hp, maxHp} }, leaderId }
+const playerParty = {}; // socketId -> partyId
+
+function getPartyId(){ return "party_" + Date.now() + "_" + Math.random().toString(36).slice(2,6); }
+function broadcastPartyUpdate(partyId){
+  const party = parties[partyId];
+  if(!party) return;
+  Object.keys(party.members).forEach(sid=>{
+    const s = io.sockets.sockets.get(sid);
+    if(s) s.emit("party_update", { partyId, members: party.members });
+  });
+}
 
 io.on("connection", (socket) => {
   console.log(`[connect] ${socket.id}`);
@@ -173,6 +189,52 @@ io.on("connection", (socket) => {
     }
   });
 
+  // Party system
+  socket.on("party_invite", (data) => {
+    const targetSocket = io.sockets.sockets.get(data.targetId);
+    if(!targetSocket) return;
+    // create a pending party id
+    const pid = getPartyId();
+    targetSocket.emit("party_invite", { partyId: pid, fromName: data.fromName, fromId: socket.id });
+  });
+
+  socket.on("party_accept", (data) => {
+    const pid = data.partyId;
+    if(!parties[pid]){
+      parties[pid] = { members: {}, leaderId: socket.id };
+    }
+    const p = players[socket.id];
+    parties[pid].members[socket.id] = { name: p?.name||"Yatri", level: p?.level||1, hp: 100, maxHp: 100 };
+    playerParty[socket.id] = pid;
+    broadcastPartyUpdate(pid);
+  });
+
+  socket.on("party_leave", () => {
+    const pid = playerParty[socket.id];
+    if(!pid || !parties[pid]) return;
+    delete parties[pid].members[socket.id];
+    delete playerParty[socket.id];
+    socket.emit("party_left");
+    if(Object.keys(parties[pid].members).length === 0) delete parties[pid];
+    else broadcastPartyUpdate(pid);
+  });
+
+  socket.on("player_hp", (data) => {
+    const pid = playerParty[socket.id];
+    if(!pid || !parties[pid]) return;
+    if(parties[pid].members[socket.id]){
+      parties[pid].members[socket.id].hp = data.hp;
+      parties[pid].members[socket.id].maxHp = data.maxHp;
+    }
+    // broadcast to other party members
+    Object.keys(parties[pid].members).forEach(sid=>{
+      if(sid!==socket.id){
+        const s=io.sockets.sockets.get(sid);
+        if(s) s.emit("player_hp_update",{id:socket.id,hp:data.hp,maxHp:data.maxHp});
+      }
+    });
+  });
+
   socket.on("disconnect", () => {
     console.log(`[disconnect] ${socket.id}`);
     delete players[socket.id];
@@ -180,6 +242,14 @@ io.on("connection", (socket) => {
     Object.keys(chatHistory).forEach((k) => {
       if (k.startsWith(`${socket.id}:`)) delete chatHistory[k];
     });
+    // cleanup party
+    const pid = playerParty[socket.id];
+    if(pid && parties[pid]){
+      delete parties[pid].members[socket.id];
+      delete playerParty[socket.id];
+      if(Object.keys(parties[pid].members).length===0) delete parties[pid];
+      else broadcastPartyUpdate(pid);
+    }
     io.emit("playerLeft", { id: socket.id });
   });
 });
